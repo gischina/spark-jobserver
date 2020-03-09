@@ -1,0 +1,183 @@
+package spark.jobserver
+
+import java.io.InputStreamReader
+import java.nio.file.Files
+import java.util.concurrent.TimeUnit
+
+import akka.actor.{ActorSystem, AddressFromURIString, Props}
+import akka.cluster.Cluster
+import com.typesafe.config.{Config, ConfigFactory, ConfigValueFactory}
+import org.apache.commons.io.FileUtils
+import org.slf4j.LoggerFactory
+import spark.jobserver.common.akka.actor.ProductionReaper
+import spark.jobserver.common.akka.actor.Reaper.WatchMe
+import spark.jobserver.util.JobServerRoles
+import spark.jobserver.io.{JobDAO, JobDAOActor}
+import spark.jobserver.util.{HadoopFSFacade, NetworkAddressFactory, Utils}
+
+import scala.concurrent.Await
+import scala.concurrent.duration._
+import scala.util.{Failure, Success, Try}
+
+/**
+ * The JobManager is the main entry point for the forked JVM process running an individual
+ * SparkContext.  It is passed $clusterAddr $actorName $systemConfigFile
+ */
+object JobManager {
+  val logger = LoggerFactory.getLogger(getClass)
+
+  // Allow custom function to create ActorSystem.  An example of why this is useful:
+  // we can have something that stores the ActorSystem so it could be shut down easily later.
+  // Args: workDir clusterAddress systemConfig
+  // Allow custom function to wait for termination. Useful in tests.
+  def start(args: Array[String], makeSystem: Config => ActorSystem,
+            waitForTermination: (ActorSystem, String, String) => Unit) {
+
+    val masterAddresses = args(0)
+    val masterSeedNodes = Try {
+      masterAddresses
+        .split(',')
+        .map(AddressFromURIString.parse)
+        .toList
+      }.getOrElse {
+        logger.info(s"Failed to parse master seed node address(es) ${masterAddresses} in JVM arguments.")
+        exitJVM
+      }
+    logger.info(s"Found master seed nodes are: ${masterAddresses}")
+
+    val managerName = args(1)
+    val loadedConfig = getConfFromFS(args(2)).getOrElse(exitJVM).withValue(
+      JobServerRoles.propertyName, ConfigValueFactory.fromAnyRef(JobServerRoles.jobserverSlave))
+    val defaultConfig = ConfigFactory.load()
+    var systemConfig = loadedConfig.withFallback(defaultConfig)
+    val master = Try(systemConfig.getString("spark.master")).toOption
+      .getOrElse("local[4]").toLowerCase()
+    val deployMode = Try(systemConfig.getString("spark.submit.deployMode")).toOption
+      .getOrElse("client").toLowerCase()
+
+    val config = if (deployMode == "cluster") {
+      Try(getNetworkAddress(systemConfig)) match {
+        case Success(Some(address)) =>
+          logger.info(s"Cluster mode: Setting akka.remote.netty.tcp.hostname to ${address}!")
+          systemConfig = systemConfig.withValue("akka.remote.netty.tcp.hostname",
+            ConfigValueFactory.fromAnyRef(address))
+        case Success(None) => // Don't change hostname
+        case Failure(e) =>
+          logger.error("Exception during network address resolution", e)
+          exitJVM
+      }
+
+      logger.info("Cluster mode: Replacing spark.jobserver.sqldao.rootdir with container tmp dir.")
+      val sqlDaoDir = Files.createTempDirectory("sqldao")
+      FileUtils.forceDeleteOnExit(sqlDaoDir.toFile)
+      val sqlDaoDirConfig = ConfigValueFactory.fromAnyRef(sqlDaoDir.toAbsolutePath.toString)
+      systemConfig.withValue("spark.jobserver.sqldao.rootdir", sqlDaoDirConfig)
+                  .withoutPath("akka.remote.netty.tcp.port")
+                  .withValue("akka.remote.netty.tcp.port", ConfigValueFactory.fromAnyRef(0))
+    } else {
+      systemConfig
+    }
+
+    val system = makeSystem(config.resolve())
+    val clazz = Class.forName(config.getString("spark.jobserver.jobdao"))
+    val ctor = clazz.getDeclaredConstructor(Class.forName("com.typesafe.config.Config"))
+    val jobDAO = ctor.newInstance(config).asInstanceOf[JobDAO]
+    val daoActor = system.actorOf(Props(classOf[JobDAOActor], jobDAO), "dao-manager-jobmanager")
+
+    logger.info("Starting JobManager named " + managerName + " with config {}",
+      config.getConfig("spark").root.render())
+
+    val masterAddress = systemConfig.getBoolean("spark.jobserver.kill-context-on-supervisor-down") match {
+      /*
+       * TODO
+       * Note: This zombie killing logic has to be replaced by a proper split brain
+       * resolver, since the fix of resolving the AkkaClusterSupervisor no longer works
+       * when there is more than one Jobserver in the cluster (as it might be there or not).
+       */
+      case true => masterSeedNodes.head.toString + "/user/singleton/context-supervisor"
+      case false => ""
+    }
+
+    val contextId = managerName.replace(AkkaClusterSupervisorActor.MANAGER_ACTOR_PREFIX, "")
+    val jobManager = system.actorOf(JobManagerActor.props(daoActor, masterAddress, contextId,
+        getManagerInitializationTimeout(systemConfig)), managerName)
+
+    // Join akka cluster
+    logger.info("Joining cluster at address(es) {}", masterSeedNodes.mkString(", "))
+    Cluster(system).joinSeedNodes(masterSeedNodes)
+
+    val reaper = system.actorOf(Props[ProductionReaper])
+    reaper ! WatchMe(jobManager)
+
+    waitForTermination(system, master, deployMode)
+  }
+
+  private def getConfFromFS(path: String): Option[Config] = {
+    new HadoopFSFacade(defaultFS = "file:///").get(path) match {
+      case Some(stream) =>
+        // Since config contains characters, we convert the input stream
+        // to InputStreamReader.
+        val reader = new InputStreamReader(stream)
+        Try(Utils.usingResource(reader)(ConfigFactory.parseReader)) match {
+          case Success(config) => Some(config)
+          case Failure(t) =>
+            logger.error(t.getMessage)
+            None
+        }
+      case None => None
+    }
+  }
+
+  private def getNetworkAddress(systemConfig: Config): Option[String] = {
+    systemConfig.hasPath("spark.jobserver.network-address-resolver") match {
+      case true =>
+        val strategyShortName = systemConfig.getString("spark.jobserver.network-address-resolver")
+        NetworkAddressFactory(strategyShortName).getAddress()
+      case false => None
+    }
+  }
+
+  /**
+    * 0 is used as exit code to avoid restart of JVM by Spark in supervise mode
+    */
+  private def exitJVM = {
+    logger.warn("Exiting the JVM with status code of 0")
+    sys.exit(0)
+  }
+
+  def main(args: Array[String]) {
+    import scala.collection.JavaConverters._
+
+    def makeManagerSystem(name: String)(config: Config): ActorSystem = {
+      val configWithRole = config.withValue("akka.cluster.roles",
+        ConfigValueFactory.fromIterable(List("manager").asJava))
+      ActorSystem(name, configWithRole)
+    }
+
+    def waitForTermination(system: ActorSystem, master: String, deployMode: String) {
+      if (master == "yarn" && deployMode == "cluster") {
+        // YARN Cluster Mode:
+        // Finishing the main method means that the job has been done and immediately finishes
+        // the driver process, that why we have to wait here.
+        // Calling System.exit results in a failed YARN application result:
+        // org.apache.spark.deploy.yarn.ApplicationMaster#runImpl() in Spark
+        Await.result(system.terminate(), Duration.Inf)
+      } else {
+        // Spark Standalone Cluster Mode:
+        // We have to call System.exit(0) otherwise the driver process keeps running
+        // after the context has been stopped.
+        system.registerOnTermination {
+          logger.info("Actor system terminated. Exiting the JVM with exit code 0.")
+          System.exit(0)
+        }
+      }
+    }
+
+    start(args, makeManagerSystem("JobServer"), waitForTermination)
+  }
+
+  private def getManagerInitializationTimeout(config: Config): FiniteDuration = {
+    FiniteDuration(config.getDuration("spark.jobserver.manager-initialization-timeout",
+        TimeUnit.MILLISECONDS), TimeUnit.MILLISECONDS)
+  }
+}

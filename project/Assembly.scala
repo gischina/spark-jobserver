@@ -5,14 +5,15 @@ import sbtassembly.AssemblyPlugin.autoImport._
 object Assembly {
   lazy val settings = Seq(
     assemblyJarName in assembly := "spark-job-server.jar",
-    // uncomment below to exclude tests
+      // uncomment below to exclude tests
     // test in assembly := {},
-    assemblyExcludedJars in assembly <<= (fullClasspath in assembly) map { _ filter { cp =>
+    assemblyExcludedJars in assembly := (fullClasspath in assembly).map(_.filter { cp =>
       List("servlet-api", "guice-all", "junit", "uuid",
         "jetty", "jsp-api-2.0", "antlr", "avro", "slf4j-log4j", "log4j-1.2",
-        "scala-actors", "spark", "commons-cli", "stax-api", "mockito").exists(cp.data.getName.startsWith(_))
-    } },
-    assembleArtifact in packageScala := false,   // We don't need the Scala library, Spark already includes it
+        "scala-actors", "commons-cli", "stax-api", "mockito").exists(cp.data.getName.startsWith(_))
+    }).value,
+    // We don't need the Scala library, Spark already includes it
+    assembleArtifact in assemblyPackageScala := false,
     assemblyMergeStrategy in assembly := {
       case m if m.toLowerCase.endsWith("manifest.mf") => MergeStrategy.discard
       case m if m.toLowerCase.matches("meta-inf.*\\.sf$") => MergeStrategy.discard

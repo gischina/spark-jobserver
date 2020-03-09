@@ -1,19 +1,21 @@
-addSbtPlugin("io.spray" % "sbt-revolver" % "0.7.2")       // For quick restarts for web development
-
-addSbtPlugin("com.typesafe.sbt" % "sbt-scalariform" % "1.3.0")
-
-addSbtPlugin("com.eed3si9n" % "sbt-assembly" % "0.14.1")
-
-addSbtPlugin("org.scalastyle" %% "scalastyle-sbt-plugin" % "0.8.0")
-
 resolvers += Classpaths.sbtPluginReleases
 
-addSbtPlugin("org.scoverage" %% "sbt-scoverage" % "1.2.0")
+addSbtPlugin("com.timushev.sbt" % "sbt-updates" % "0.3.4")
 
-addSbtPlugin("me.lessis" % "bintray-sbt" % "0.2.1")
+addSbtPlugin("io.spray" % "sbt-revolver" % "0.9.1")       // For quick restarts for web development
 
-addSbtPlugin("me.lessis" % "ls-sbt" % "0.1.3")
+addSbtPlugin("org.scalariform" % "sbt-scalariform" % "1.8.2")
 
-addSbtPlugin("com.github.gseitz" % "sbt-release" % "0.8.5")
+addSbtPlugin("com.eed3si9n" % "sbt-assembly" % "0.14.7")
 
-addSbtPlugin("se.marcuslonnberg" % "sbt-docker" % "1.2.0")
+addSbtPlugin("org.scalastyle" %% "scalastyle-sbt-plugin" % "1.0.0")
+
+addSbtPlugin("org.scoverage" %% "sbt-scoverage" % "1.5.1")
+
+addSbtPlugin("org.foundweekends" % "sbt-bintray" % "0.5.4")
+
+addSbtPlugin("com.github.gseitz" % "sbt-release" % "1.0.9")
+
+addSbtPlugin("se.marcuslonnberg" % "sbt-docker" % "1.5.0")
+
+addSbtPlugin("com.typesafe.sbt" % "sbt-multi-jvm" % "0.4.0")

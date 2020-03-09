@@ -1,4 +1,20 @@
+<!-- START doctoc generated TOC please keep comment here to allow auto update -->
+<!-- DON'T EDIT THIS SECTION, INSTEAD RE-RUN doctoc TO UPDATE -->
+**Table of Contents**  *generated with [DocToc](https://github.com/thlorenz/doctoc)*
+
+- [Step by step instruction on how to run Spark Job Server on EMR 4.2.0 (Spark 1.6.0)](#step-by-step-instruction-on-how-to-run-spark-job-server-on-emr-420-spark-160)
+  - [Create EMR 4.2.0 cluster](#create-emr-420-cluster)
+  - [Configure master box](#configure-master-box)
+  - [Build spark-jobserver distribution](#build-spark-jobserver-distribution)
+  - [Deploy spark-jobserver](#deploy-spark-jobserver)
+  - [Test spark-jobserver](#test-spark-jobserver)
+  - [Troubleshooting](#troubleshooting)
+
+<!-- END doctoc generated TOC please keep comment here to allow auto update -->
+
 ## Step by step instruction on how to run Spark Job Server on EMR 4.2.0 (Spark 1.6.0)
+
+See also running in [cluster mode](cluster.md), running [YARN in client mode](yarn.md) and running on [Mesos](Mesos.md).
 
 ### Create EMR 4.2.0 cluster
 
@@ -38,7 +54,7 @@ InstanceCount=10,BidPrice=2.99,Name=sparkSlave,InstanceGroupType=CORE,InstanceTy
 
 ### Build spark-jobserver distribution
 
-1. Install sbt 0.13.9 as described here http://www.scala-sbt.org/0.13/tutorial/Manual-Installation.html
+1. Install sbt as described here https://www.scala-sbt.org/download.html
 2. Install jdk 1.7.0 and git
  ```
  sudo yum install java-1.7.0-openjdk-devel git
@@ -71,6 +87,11 @@ InstanceCount=10,BidPrice=2.99,Name=sparkSlave,InstanceGroupType=CORE,InstanceTy
  HADOOP_CONF_DIR=/etc/hadoop/conf
  YARN_CONF_DIR=/etc/hadoop/conf
  SCALA_VERSION=2.10.5
+ MANAGER_JAR_FILE="$appdir/spark-job-server.jar"
+ MANAGER_CONF_FILE="$(basename $conffile)"
+ MANAGER_EXTRA_JAVA_OPTIONS=
+ MANAGER_EXTRA_SPARK_CONFS="spark.yarn.submit.waitAppCompletion=false|spark.files=$appdir/log4jcluster.properties,$conffile"
+ MANAGER_LOGGING_OPTS="-Dlog4j.configuration=log4j-cluster.properties"
  ```
 
 6. Create config/emr.conf
@@ -80,10 +101,33 @@ InstanceCount=10,BidPrice=2.99,Name=sparkSlave,InstanceGroupType=CORE,InstanceTy
    master = "yarn-client"
    jobserver {
      port = 8090
-     jar-store-rootdir = /mnt/tmp/spark-jobserver/jars
-     jobdao = spark.jobserver.io.JobFileDAO
-     filedao {
-       rootdir = /mnt/tmp/spark-jobserver/filedao/data
+     jobdao = spark.jobserver.io.JobSqlDAO
+
+     sqldao {
+       # Slick database driver, full classpath
+       slick-driver = slick.driver.H2Driver
+
+       # JDBC driver, full classpath
+       jdbc-driver = org.h2.Driver
+
+       # Directory where binaries are cached and default H2 driver stores its data
+       rootdir = /tmp/spark-jobserver/sqldao/data
+
+       # Full JDBC URL / init string, along with username and password.  Sorry, needs to match above.
+       # Substitutions may be used to launch job-server, but leave it out here in the default or tests won't pass
+       jdbc {
+         url = "jdbc:h2:file:/tmp/spark-jobserver/sqldao/data/h2-db"
+         user = ""
+         password = ""
+       }
+
+       # DB connection pool settings
+       dbcp {
+         enabled = false
+         maxactive = 20
+         maxidle = 10
+         initialsize = 10
+       }
      }
    }
    # predefined Spark contexts
@@ -163,7 +207,7 @@ InstanceCount=10,BidPrice=2.99,Name=sparkSlave,InstanceGroupType=CORE,InstanceTy
 3. Create test context
  ```
  # create test context
- curl -d "" 'localhost:8090/contexts/test?num-cpu-cores=1&memory-per-node=512m&spark.executor.instances=1'
+ curl -d "" "localhost:8090/contexts/test?num-cpu-cores=1&memory-per-node=512m&spark.executor.instances=1"
  # check current contexts. should return test
  curl localhost:8090/contexts
  ```
@@ -172,7 +216,7 @@ InstanceCount=10,BidPrice=2.99,Name=sparkSlave,InstanceGroupType=CORE,InstanceTy
  ```
  # run WordCount example (should be done in 1-2 sec)
  curl -d "input.string = a b c a b see" \
- 'localhost:8090/jobs?appName=testapp&classPath=spark.jobserver.WordCountExample&context=test&sync=true'
+ "localhost:8090/jobs?appName=testapp&classPath=spark.jobserver.WordCountExample&context=test&sync=true"
  ```
 
 5. Check jobs
